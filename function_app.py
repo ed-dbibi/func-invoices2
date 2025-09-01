@@ -1,4 +1,4 @@
-import os, json, logging
+import os, json, logging, re
 import azure.functions as func
 
 from azure.ai.documentintelligence import DocumentIntelligenceClient
@@ -6,13 +6,14 @@ from azure.ai.documentintelligence.models import AnalyzeDocumentRequest, Documen
 from azure.core.credentials import AzureKeyCredential
 from azure.storage.blob import BlobServiceClient
 
-# --- NEW ---
-import pyodbc, datetime as dt   # <— insertion SQL
+# --- NEW: SQL via python-tds (pur Python) ---
+import datetime as dt
+import tds  # pip install python-tds
 
 # --- Function App (Python v2)
 app = func.FunctionApp()
 
-# --- Config (depuis local.settings.json / App Settings en Azure)
+# --- Config (depuis App Settings Azure / local.settings.json)
 ENDPOINT = (os.getenv("AZURE_DI_ENDPOINT") or "").strip().rstrip("/")
 KEY      = (os.getenv("AZURE_DI_KEY") or "").strip()
 MODEL_ID = (os.getenv("AZURE_DI_MODEL_ID") or "").strip()
@@ -20,11 +21,11 @@ MODEL_ID = (os.getenv("AZURE_DI_MODEL_ID") or "").strip()
 ARCHIVE_CONTAINER = os.getenv("ARCHIVE_CONTAINER", "archive")
 STORAGE_CONN_STR  = os.getenv("AzureWebJobsStorage")
 
-# --- NEW --- (connexion SQL + valeurs par défaut)
-SQL_CONN_STR       = os.getenv("SQL_CONN_STR")
-DEFAULT_STATUS_ID  = int(os.getenv("DEFAULT_STATUS_ID", "1"))
-DEFAULT_SITE_ID    = int(os.getenv("DEFAULT_SITE_ID", "1"))
-CREATED_BY         = os.getenv("CREATED_BY", "function-app")
+# SQL (format simple conseillé: Server=...;Database=...;User Id=...;Password=...;Encrypt=yes)
+SQL_CONN_STR      = os.getenv("SQL_CONN_STR", "")
+DEFAULT_STATUS_ID = int(os.getenv("DEFAULT_STATUS_ID", "1"))
+DEFAULT_SITE_ID   = int(os.getenv("DEFAULT_SITE_ID", "1"))
+CREATED_BY        = os.getenv("CREATED_BY", "function-app")
 
 # --- Clients
 di_client = DocumentIntelligenceClient(endpoint=ENDPOINT, credential=AzureKeyCredential(KEY))
@@ -58,15 +59,30 @@ def save_json_to_archive(source_blob_name: str, data: dict):
     archive_container.upload_blob(name=out_name, data=payload, overwrite=True)
     logging.info(f"🗄️ JSON archivé dans {ARCHIVE_CONTAINER}/{out_name}")
 
-# ---------- NEW : insertion SQL ----------
+# ---------- SQL (python-tds) ----------
+_CONN_RE = re.compile(
+    r"Server=tcp:([^,]+),(\d+);Database=([^;]+);User Id=([^;]+);Password=([^;]+);", re.I
+)
+
+def _connect_sql_from_connstr(conn_str: str):
+    m = _CONN_RE.search(conn_str or "")
+    if not m:
+        raise ValueError("SQL_CONN_STR invalide. Attendu: "
+                         "Server=tcp:<srv>,1433;Database=<db>;User Id=<user>;Password=<pwd>;Encrypt=yes")
+    server, port, database, user, pwd = m.group(1), int(m.group(2)), m.group(3), m.group(4), m.group(5)
+    return tds.connect(
+        server=server, port=port, user=user, password=pwd,
+        database=database, encrypt=True, autocommit=False
+    )
+
 def save_to_db(fields: dict, blob_name: str, account_url: str, container: str):
-    # Récup champs issus du modèle
+    # Champs issus du modèle
     num   = (fields.get("NumeroFacture") or {}).get("value")
     issue = (fields.get("DateEmission")  or {}).get("value")
     due   = (fields.get("DateEcheance")  or {}).get("value")
     amt   = (fields.get("MontantTotal")  or {}).get("value")
 
-    # Normalisation douce date / montant
+    # Normalisation date / montant
     def to_date(s):
         if not s: return None
         for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%d/%m/%Y"):
@@ -75,8 +91,7 @@ def save_to_db(fields: dict, blob_name: str, account_url: str, container: str):
         return None
 
     def to_amount(s):
-        if s is None: return 0
-        # supprime espaces / non-breakable, enlève séparateur de milliers, remplace virgule décimale
+        if s is None: return 0.0
         return float(str(s).replace(" ", "").replace("\u00a0","").replace(".", "").replace(",", "."))
 
     date_issue = to_date(issue)
@@ -84,24 +99,23 @@ def save_to_db(fields: dict, blob_name: str, account_url: str, container: str):
     amount     = to_amount(amt)
     now        = dt.datetime.utcnow()
 
-    # Métadonnées fichier
-    original = os.path.basename(blob_name)  # ex: facture2.pdf
+    original = os.path.basename(blob_name)
     file_url = f"{account_url}/{container}/{original}"
 
-    # Inserts
-    with pyodbc.connect(SQL_CONN_STR) as conn:
+    with _connect_sql_from_connstr(SQL_CONN_STR) as conn:
         cur = conn.cursor()
 
-        # 1) files.AppFile
+        # files.AppFile
         cur.execute("""
             INSERT INTO files.AppFile
             (SourceName, SourceId, ContainerName, OriginalFileName, SystemFileName, DateCreation, FileUrl)
             OUTPUT INSERTED.Id
             VALUES (?,?,?,?,?,?,?)
         """, ("blobTrigger", blob_name, container, original, original, now, file_url))
-        file_id = cur.fetchone()[0]
+        row = cur.fetchone()
+        file_id = row[0] if row else None
 
-        # 2) invoices.Invoice
+        # invoices.Invoice
         cur.execute("""
             INSERT INTO invoices.Invoice
             (Number, SiteId, RefInvoiceStatusId, IsArchived, DateIssue, DateDue, Amount, FileId, DateCreated, CreatedBy)
@@ -136,9 +150,9 @@ def ProcessInvoice(myblob: func.InputStream):
         # 1) Archive JSON d’audit
         save_json_to_archive(myblob.name, data)
 
-        # 2) NEW : Insert en base
+        # 2) Insert en base (sql)
         account_url = blob_service.url
         save_to_db(data, myblob.name, account_url, container="eem-training")
 
     except Exception as e:
-        logging.exception(f" Erreur traitement blob: {e}")
+        logging.exception(f"Erreur traitement blob: {e}")
