@@ -17,7 +17,7 @@ ENDPOINT = (os.getenv("AZURE_DI_ENDPOINT") or "").strip().rstrip("/")
 KEY      = (os.getenv("AZURE_DI_KEY") or "").strip()
 MODEL_ID = (os.getenv("AZURE_DI_MODEL_ID") or "").strip()
 
-ARCHIVE_CONTAINER = os.getenv("ARCHIVE_CONTAINER", "eem-archive")
+ARCHIVE_CONTAINER = os.getenv("ARCHIVE_CONTAINER", "archive")
 STORAGE_CONN_STR  = os.getenv("AzureWebJobsStorage")
 
 # --- NEW --- (connexion SQL + valeurs par défaut)
@@ -113,6 +113,7 @@ def save_to_db(fields: dict, blob_name: str, account_url: str, container: str):
     logging.info(f"🗃️ SQL OK — Invoice.Number={num}  Amount={amount}")
 
 # ----- BLOB TRIGGER : écoute 'eem-training/{name}'
+@app.function_name(name="ProcessInvoice")
 @app.blob_trigger(arg_name="myblob", path="eem-training/{name}", connection="AzureWebJobsStorage")
 def ProcessInvoice(myblob: func.InputStream):
     try:
